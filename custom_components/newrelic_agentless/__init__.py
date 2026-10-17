@@ -7,21 +7,11 @@ import dateutil.parser
 import json
 import orjson
 import asyncio
-import ssl
-import threading
+import copy
+import math
 from collections.abc import Callable
 
-
-from datadog_api_client import AsyncApiClient, Configuration
-from datadog_api_client.v2.api.metrics_api import MetricsApi
-from datadog_api_client.v2.model.metric_content_encoding import MetricContentEncoding
-from datadog_api_client.v2.model.metric_intake_type import MetricIntakeType
-from datadog_api_client.v2.model.metric_payload import MetricPayload
-from datadog_api_client.v2.model.metric_point import MetricPoint
-from datadog_api_client.v2.model.metric_series import MetricSeries
-
-from datadog_api_client.v1.api.events_api import EventsApi
-from datadog_api_client.v1.model.event_create_request import EventCreateRequest
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from homeassistant.const import Platform, EVENT_STATE_CHANGED, MATCH_ALL, EVENT_HOMEASSISTANT_STOP
 from homeassistant.helpers.device_registry import EVENT_DEVICE_REGISTRY_UPDATED
@@ -35,7 +25,8 @@ from homeassistant.const import __version__ as HAVERSION
 import homeassistant.const
 from homeassistant.core import HomeAssistant, Event, EventStateChangedData, State, callback
 from homeassistant.config_entries import ConfigEntry
-from .const import DOMAIN
+from .const import DOMAIN, CONF_LICENSE_KEY, CONF_REGION, CONF_ENV, DEFAULT_REGION, EVENT_TYPE
+from .newrelic_client import NewRelicClient, tags_to_attributes, truncate
 from homeassistant.helpers.state import state_as_number
 from homeassistant.components.sensor.const import SensorDeviceClass
 
@@ -58,48 +49,27 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     constant_emitter = ConstantMetricEmitter()
 
     creds = entry.data
-    configuration = Configuration(
-            api_key={"apiKeyAuth": creds["api_key"],
-                     },
-            server_variables={"site": creds["site"]},
-            request_timeout=5,
-            enable_retry=True,
+    client = NewRelicClient(
+            async_get_clientsession(hass),
+            creds[CONF_LICENSE_KEY],
+            creds.get(CONF_REGION, DEFAULT_REGION),
     )
-    api_client = AsyncApiClient(configuration)
-    metrics_api = MetricsApi(api_client)
-
-    # Pre-load SSL default certificates in a background thread to avoid
-    # blocking the event loop on the first API call (Python 3.14+).
-    # See https://github.com/kamaradclimber/datadog-integration-ha/issues/46
-    def _warm_ssl_context():
-        ssl.create_default_context()
-    threading.Thread(target=_warm_ssl_context, daemon=True).start()
-
-    # Store api_client for cleanup
-    hass.data[DOMAIN][entry.entry_id]["api_client"] = api_client
 
     metrics_queue = asyncio.Queue(maxsize=0)
     @callback
     def metrics_dequeue_callback(now) -> None:
-        entry.async_create_background_task(hass, send_metrics_loop(metrics_queue, metrics_api, constant_emitter), name="dequeue metrics to be sent to dd", eager_start=True)
-    metrics_cancel_schedule = async_track_time_interval(hass, metrics_dequeue_callback, datetime.timedelta(seconds=10))
-    def metrics_cancel_dequeuing(*_: Any) -> None:
-        metrics_cancel_schedule()
-    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, metrics_cancel_dequeuing)
+        entry.async_create_background_task(hass, send_metrics_loop(metrics_queue, client, constant_emitter), name="dequeue metrics to be sent to new relic", eager_start=True)
+    entry.async_on_unload(async_track_time_interval(hass, metrics_dequeue_callback, datetime.timedelta(seconds=10)))
 
     event_listener=partial(full_event_listener, entry.data, hass, constant_emitter, metrics_queue)
     unsubscribe = hass.bus.async_listen(EVENT_STATE_CHANGED, event_listener)
     hass.data[DOMAIN][entry.entry_id]["unsubscribe_handler"] = unsubscribe
 
-    events_api = EventsApi(api_client)
     events_queue = asyncio.Queue(maxsize=0)
     @callback
     def events_dequeue_callback(now) -> None:
-        entry.async_create_background_task(hass, send_events_loop(events_queue, events_api), name="dequeue events to be sent to dd", eager_start=True)
-    events_cancel_schedule = async_track_time_interval(hass, events_dequeue_callback, datetime.timedelta(seconds=10))
-    def events_cancel_dequeuing(*_: Any) -> None:
-        events_cancel_schedule()
-    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, events_cancel_dequeuing)
+        entry.async_create_background_task(hass, send_events_loop(events_queue, client), name="dequeue events to be sent to new relic", eager_start=True)
+    entry.async_on_unload(async_track_time_interval(hass, events_dequeue_callback, datetime.timedelta(seconds=10)))
 
     all_event_listener=partial(full_all_event_listener, entry.data, events_queue)
     unsubscribe_all_events = hass.bus.async_listen(MATCH_ALL, all_event_listener)
@@ -107,22 +77,32 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     return True
 
-# this function will constantly dequeue metrics to send them by batch to the dd api
-async def send_events_loop(queue, events_api):
+EVENTS_BATCH_SIZE = 500
+METRICS_BATCH_SIZE = 1024
+
+
+def _drain(queue: asyncio.Queue, limit: int) -> list:
+    items = []
+    while len(items) < limit and not queue.empty():
+        items.append(queue.get_nowait())
+    return items
+
+
+# dequeue events and send them by batch to the New Relic Event API
+async def send_events_loop(queue, client: NewRelicClient):
     _LOGGER.debug("Starting dequeuing from events queue")
     while not queue.empty():
+        events = _drain(queue, EVENTS_BATCH_SIZE)
         try:
-            event_request = await queue.get()
-            _LOGGER.debug("Sending one event to dd api")
-            response = await events_api.create_event(body=event_request)
-            if response.status != "ok":
-                _LOGGER.error(f"Error sending event to Datadog {response["errors"]}")
+            _LOGGER.debug(f"Sending {len(events)} events to New Relic")
+            await client.send_events(events)
         except Exception as e:
-            _LOGGER.exception(f"An error happened when sending events to dd: {e}")
+            _LOGGER.error(f"Error sending {len(events)} events to New Relic, dropping them: {e}")
     _LOGGER.debug("Events queue is now empty, waiting for next run")
 
-# this function will constantly dequeue metrics to send them by batch to the dd api
-async def send_metrics_loop(queue, metrics_api, constant_emitter):
+
+# dequeue metrics and send them by batch to the New Relic Metric API
+async def send_metrics_loop(queue, client: NewRelicClient, constant_emitter):
     _LOGGER.debug("Checking if time to flush old series")
     if constant_emitter.should_flush():
         old_series = await constant_emitter.flush_old_series()
@@ -130,19 +110,12 @@ async def send_metrics_loop(queue, metrics_api, constant_emitter):
             await queue.put(serie)
     _LOGGER.debug("Starting dequeuing from metrics queue")
     while not queue.empty():
+        metrics = _drain(queue, METRICS_BATCH_SIZE)
         try:
-            series = []
-            while len(series) < 1024 and not queue.empty():
-                series.append(await queue.get())
-
-            if len(series) > 0:
-                payload = MetricPayload(series=series)
-                _LOGGER.debug(f"Sending {len(series)} metrics to the api")
-                response = await metrics_api.submit_metrics(content_encoding=MetricContentEncoding.ZSTD1, body=payload)
-                if len(response["errors"]) > 0:
-                    _LOGGER.error(f"Error sending metric to Datadog {response['errors'][0]}")
+            _LOGGER.debug(f"Sending {len(metrics)} metrics to New Relic")
+            await client.send_metrics(metrics)
         except Exception as e:
-            _LOGGER.exception(f"An error happened when sending metrics to dd: {e}")
+            _LOGGER.error(f"Error sending {len(metrics)} metrics to New Relic, dropping them: {e}")
     _LOGGER.debug("Metrics queue is now empty, waiting for next run")
 
 
@@ -166,8 +139,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.data[DOMAIN][entry.entry_id]["unsubscribe_handler"]()
     if "unsubscribe_all_event_handler" in hass.data[DOMAIN][entry.entry_id]:
         hass.data[DOMAIN][entry.entry_id]["unsubscribe_all_event_handler"]()
-    if "api_client" in hass.data[DOMAIN][entry.entry_id]:
-        await hass.data[DOMAIN][entry.entry_id]["api_client"].close()
+    hass.data[DOMAIN].pop(entry.entry_id, None)
     return unload_ok
 
 PREFIX = "hass"
@@ -180,20 +152,21 @@ class ConstantMetricEmitter:
         self.flush_interval = 250
         self.mutex = asyncio.Lock()
 
-    async def record_last_sent(self, metric: MetricSeries) -> None:
+    async def record_last_sent(self, metric: dict) -> None:
         async with self.mutex:
-            self.last_sent[(metric.metric, tuple(metric.tags))] = metric
+            key = (metric["name"], tuple(sorted(metric["attributes"].items())))
+            self.last_sent[key] = copy.deepcopy(metric)
 
-    async def flush_old_series(self) -> list[MetricSeries]:
+    async def flush_old_series(self) -> list[dict]:
         async with self.mutex:
             now = int(datetime.datetime.now().timestamp())
             old_series = []
             for metric_id in self.last_sent:
                 serie = self.last_sent[metric_id]
-                if serie.points[0].timestamp < now - self.flush_interval:
-                    serie.points[0].timestamp = now
-                    # _LOGGER.debug(f"Will flush {serie.metric} {serie.tags}")
-                    old_series.append(serie)
+                # metric timestamps are in milliseconds
+                if serie["timestamp"] < (now - self.flush_interval) * 1000:
+                    serie["timestamp"] = now * 1000
+                    old_series.append(copy.deepcopy(serie))
             self.last_flush = now
             _LOGGER.info(f"Flushing {len(old_series)} old metrics (out of {len(self.last_sent)}) to make sure we have regular points")
             return old_series
@@ -482,7 +455,7 @@ async def unsafe_full_event_listener(creds: dict, hass, constant_emitter: Consta
         return
     common_tags = additional_tags(hass, new_state)
     for (name, unit, value) in values:
-        tags = common_tags + [f"entity:{name}", "service:home-assistant", f"version:{HAVERSION}", f"env:{creds['env']}"]
+        tags = common_tags + [f"entity:{name}", "service:home-assistant", f"version:{HAVERSION}", f"env:{creds[CONF_ENV]}"]
         unit_name = None
         if unit is not None:
             unit_name, conversion = unit
@@ -496,8 +469,12 @@ async def unsafe_full_event_listener(creds: dict, hass, constant_emitter: Consta
         timestamp = new_state.last_changed
         if isinstance(value, bool):
             value = int(value)
-        metric_serie = MetricSeries(metric=metric_name, type=MetricIntakeType.GAUGE, tags=tags, unit=unit_name,
-                           points=[MetricPoint(timestamp=int(timestamp.timestamp()), value=value)])
+        if not isinstance(value, (int, float)) or not math.isfinite(value):
+            # NaN / inf cannot be encoded as JSON numbers
+            continue
+        if unit_name is not None:
+            tags.append(f"unit:{unit_name}")
+        metric_serie = build_metric(metric_name, value, timestamp, tags)
         await metrics_queue.put(metric_serie)
         await constant_emitter.record_last_sent(metric_serie)
 
@@ -514,19 +491,41 @@ async def unsafe_full_all_event_listener(creds: dict, events_queue, event: Event
             # in addition we expect events about "metrics" to change more often than the others
             return
 
-    tags = ["service:home-assistant", f"version:{HAVERSION}", f"event_type:{event.event_type}", f"env:{creds['env']}"]
+    tags = ["service:home-assistant", f"version:{HAVERSION}", f"event_type:{event.event_type}", f"env:{creds[CONF_ENV]}"]
     if event.event_type == homeassistant.const.EVENT_STATE_CHANGED:
         text=json.dumps(orjson.loads(orjson.dumps(event.json_fragment)), default=str)
     else:
         text=json.dumps(event.as_dict(), default=str)
     title, event_specific_tags = generate_message(event)
-    event_request = EventCreateRequest(
-            date_happened=int(event.time_fired.timestamp()),
-            title=title,
-            text=text,
-            tags=tags + event_specific_tags,
-    )
-    await events_queue.put(event_request)
+    await events_queue.put(build_event(title, text, event.time_fired, tags + event_specific_tags))
+
+
+# Attributes New Relic reserves or that we set ourselves: never let a tag override them.
+RESERVED_ATTRIBUTES = {"eventType", "timestamp", "accountId", "appId", "entity.guid", "entity.name", "entity.type", "title", "text"}
+
+
+def build_metric(name: str, value: float, timestamp: datetime.datetime, tags: list[str]) -> dict:
+    """Build one gauge datapoint in New Relic Metric API format."""
+    attributes = {k: v for k, v in tags_to_attributes(tags).items() if k not in RESERVED_ATTRIBUTES}
+    return {
+        "name": name,
+        "type": "gauge",
+        "value": value,
+        "timestamp": int(timestamp.timestamp() * 1000),
+        "attributes": attributes,
+    }
+
+
+def build_event(title: str, text: str, time_fired: datetime.datetime, tags: list[str]) -> dict:
+    """Build one custom event in New Relic Event API format."""
+    event = {k: truncate(v) for k, v in tags_to_attributes(tags).items() if k not in RESERVED_ATTRIBUTES}
+    event.update({
+        "eventType": EVENT_TYPE,
+        "timestamp": int(time_fired.timestamp() * 1000),
+        "title": title,
+        "text": truncate(text),
+    })
+    return event
 
 
 
@@ -587,13 +586,6 @@ def build_state_tag(event) -> Tuple[Optional[str], list[str]]:
     if new_state.state == "":
         return (None, [])
     return (new_state.state, [])
-
-async def async_migrate_entry(hass, config_entry: ConfigEntry):
-    if config_entry.version == 1:
-        _LOGGER.warning("config entry is version 1, migrating to version 2")
-        new = {**config_entry.data}
-        new["env"] = "prod"
-        hass.config_entries.async_update_entry(config_entry, data=new, version=2)
 
 def label_id_to_name(label_registry, label_id) -> str:
     label = label_registry.async_get_label(label_id)

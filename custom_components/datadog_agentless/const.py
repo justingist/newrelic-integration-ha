@@ -1,1 +1,0 @@
-DOMAIN = "datadog_agentless"

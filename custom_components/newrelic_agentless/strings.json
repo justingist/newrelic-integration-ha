@@ -1,0 +1,23 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "data": {
+          "license_key": "License key (INGEST - LICENSE)",
+          "region": "Data center region",
+          "env": "Environment of this instance (dev/prod)"
+        },
+        "description": "Enter a New Relic license (ingest) key. User keys (NRAK-...) will not work.",
+        "title": "Set up New Relic integration"
+      }
+    },
+    "error": {
+      "invalid_auth": "New Relic rejected this key. Make sure it is an INGEST - LICENSE key for the selected region.",
+      "cannot_connect": "Could not reach New Relic.",
+      "unknown": "Unexpected error, see the Home Assistant logs."
+    },
+    "abort": {
+      "already_configured": "This key and environment are already configured."
+    }
+  }
+}

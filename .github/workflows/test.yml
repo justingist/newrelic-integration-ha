@@ -22,4 +22,4 @@ jobs:
                 pip install -r requirements.txt
             - name: Execute test
               run: |
-                python -m unittest custom_components/datadog_agentless/tests/test_extract_states.py
+                python -m unittest discover -s custom_components/newrelic_agentless/tests -t .

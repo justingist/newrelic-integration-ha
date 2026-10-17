@@ -1,0 +1,14 @@
+{
+  "domain": "newrelic_agentless",
+  "name": "New Relic agentless",
+  "codeowners": [],
+  "config_flow": true,
+  "documentation": "https://github.com/OWNER/newrelic-integration-ha",
+  "integration_type": "service",
+  "iot_class": "cloud_push",
+  "issue_tracker": "https://github.com/OWNER/newrelic-integration-ha/issues",
+  "requirements": [
+    "python-dateutil"
+  ],
+  "version": "0.1.0"
+}

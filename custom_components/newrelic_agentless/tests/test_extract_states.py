@@ -7,7 +7,7 @@ sys.path.append(parent_dir)
 import time
 
 from homeassistant.core import Event, EventStateChangedData, EventOrigin, Context, State
-from custom_components.datadog_agentless import extract_states, _extract_state
+from custom_components.newrelic_agentless import extract_states, _extract_state
 
 import unittest
 import json
