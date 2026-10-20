@@ -14,7 +14,7 @@ normalisation and label handling are unchanged; only the transport and data form
 Through HACS, as a custom repository:
 
 1. In HACS, open the menu → **Custom repositories**
-1. Add `https://github.com/OWNER/newrelic-integration-ha` with category **Integration**
+1. Add `https://github.com/justingist/newrelic-integration-ha` with category **Integration**
 1. Install **New Relic Agentless** and restart Home Assistant
 1. Go to **Settings → Devices & services → Add integration** and pick **New Relic agentless**
 
